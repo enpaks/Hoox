@@ -1303,8 +1303,11 @@ void maybe_split(VkCommandBuffer& cmd) {
 // (hookshot) One cause of those is gone: the dry pass did not mark the targets of a clear (NOP_CLEAR_COLOR in replay()). With
 // that, Castle Town's market and eight other places showed no black frame on 3 to 8 threads; the Kakariko walk was not run
 // again, so it stays off. On a 9950X3D the replay's wall time in the market goes from 10.9 ms a frame to 7.75 on 3 threads.
+// (hoox) On by default, 3 threads: on a Ryzen 5 5600 + RTX 3060 Ti in Kokiri Forest the replay thread went from 73% of a
+// core (82% at most) to 33%, the replay from 14.7 ms a frame to 10.6, and frames over 40 ms from 0.63% to 0.34%, with no
+// black frame seen. RX_VK_PARALLEL=0: on the replay thread alone, as before
 int par_threads() {
-    static const int n = std::clamp(getenv("RX_VK_PARALLEL") ? atoi(getenv("RX_VK_PARALLEL")) : 0, 0, 8);
+    static const int n = std::clamp(getenv("RX_VK_PARALLEL") ? atoi(getenv("RX_VK_PARALLEL")) : 3, 0, 8);
     return n;
 }
 struct ParPool {
