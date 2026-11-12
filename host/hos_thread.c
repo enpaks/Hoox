@@ -37,6 +37,8 @@ struct HosThread {
     volatile int vc_kick;
     int64_t vc_since;
     CONDITION_VARIABLE vc_cv;
+    /* (hoox, diagnostic: HOS_VCORE_WHO=1) its waits for a virtual core since the last "vcores:" line: time, count, longest */
+    int64_t vc_wait_ns, vc_wait_n, vc_wait_max;
     /* (hookshot) fibers: the context running now (NULL: ctx, the thread's own), the thread's host fiber once it
        switched to a guest fiber */
     Ctx *volatile run_ctx;
@@ -1324,6 +1326,38 @@ static void vc_grant(int c) {
     vc_take(best, c);
     WakeConditionVariable(&best->vc_cv);
 }
+/* (hoox) HOS_VCORE_WHO=1 (diagnostic): with each "vcores:" line, the threads that waited longest for a virtual core in
+   it (the time, how many waits, the longest; their priority and the cores they may use): which of the game's job threads
+   a frame's work stood still in, waiting for a core rather than for work. Holding vc_lock */
+static void vc_who_locked(int64_t span) {
+    static int on = -1;
+    if (on < 0) on = getenv("HOS_VCORE_WHO") && getenv("HOS_VCORE_WHO")[0] && getenv("HOS_VCORE_WHO")[0] != '0';
+    if (!on) return;
+    enum { TOP = 12 };
+    HosThread *top[TOP];
+    int ntop = 0;
+    const int n = nthreads < 1024 ? nthreads : 1024;
+    for (int i = 0; i < n; i++) {
+        HosThread *t = threads[i];
+        if (!t || !t->vc_wait_n) continue;
+        int k = ntop < TOP ? ntop++ : TOP;
+        if (k == TOP) {   /* (full: in place of the least, when more) */
+            if (t->vc_wait_ns <= top[TOP - 1]->vc_wait_ns) continue;
+            k = TOP - 1;
+        }
+        while (k > 0 && top[k - 1]->vc_wait_ns < t->vc_wait_ns) top[k] = top[k - 1], k--;
+        top[k] = t;
+    }
+    char line[2048];
+    int len = snprintf(line, sizeof line, "vcores: waited for a core in %.0f s (ms in all, waits, longest ms; priority, cores):",
+                       span / 1e9);
+    for (int i = 0; i < ntop && len < (int)sizeof line - 160; i++)
+        len += snprintf(line + len, sizeof line - len, " %s %.0f, %lld, %.1f; %d, %#x;", top[i]->name, top[i]->vc_wait_ns / 1e6,
+                        (long long)top[i]->vc_wait_n, top[i]->vc_wait_max / 1e6, top[i]->priority, vc_allowed(top[i]));
+    hos_log("%s", line);
+    for (int i = 0; i < n; i++)
+        if (threads[i]) threads[i]->vc_wait_ns = threads[i]->vc_wait_n = threads[i]->vc_wait_max = 0;
+}
 static void vc_stats_locked(int64_t now) {
     if (!vc_st.since) vc_st.since = now;
     if (now - vc_st.since < 5000000000LL) return;
@@ -1331,6 +1365,7 @@ static void vc_stats_locked(int64_t now) {
             (long long)vc_st.takes, (long long)vc_st.waits, vc_st.waits ? vc_st.wait_ns / 1e3 / vc_st.waits : 0.0,
             vc_st.max_ns / 1e6, (long long)vc_st.kicks, (long long)vc_st.yields, (long long)vc_st.escapes,
             (now - vc_st.since) / 1e9);
+    vc_who_locked(now - vc_st.since);
     memset(&vc_st, 0, sizeof vc_st);
     vc_st.since = now;
 }
@@ -1407,6 +1442,8 @@ static void vc_acquire(HosThread *t) {
     const int64_t waited = hos_now_ns() - t0;
     vc_st.wait_ns += waited;
     if (waited > vc_st.max_ns) vc_st.max_ns = waited;
+    t->vc_wait_ns += waited, t->vc_wait_n++;   /* (hoox: HOS_VCORE_WHO) */
+    if (waited > t->vc_wait_max) t->vc_wait_max = waited;
     vc_stats_locked(hos_now_ns());
     ReleaseSRWLockExclusive(&vc_lock);
 }
