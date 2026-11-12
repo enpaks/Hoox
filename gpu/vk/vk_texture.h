@@ -43,7 +43,7 @@ struct Texture {
     VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
     bool cube = false;        // CUBE_COMPATIBLE
     bool astc = false;        // ASTC blocks decoded into RGBA8 (block_w x block_h)
-    bool bc = false;          // (and kept as BC3: big ones, re-encoded on the GPU after decoding; vk_texture.cpp)
+    bool bc = false;          // (and kept as BC3, or BC1 when opaque (format says which): big ones, re-encoded on the GPU after decoding; vk_texture.cpp)
     bool bc_resized = false;  // (hookshot-amd: its BC3 image is a resized copy, uneven block levels on AMD; vk_texture.cpp)
     int block_w = 1, block_h = 1, bpb = 0;   // the storage's blocks
     // the game's texture
@@ -109,7 +109,8 @@ void texture_begin_recording(VkCommandBuffer upload_cmd, uint64_t value);
 bool texture_uploads_recorded();
 /// The recording's upload command buffer, to record into (its first use orders it after the work before)
 VkCommandBuffer upload_command_buffer();
-/// A copy of an RGBA8 region (decoded ASTC kept as RGBA8) into a texture kept as BC3: through the encoder
+/// A copy of an RGBA8 region (decoded ASTC kept as RGBA8), or of a BC one of the other BC format, into a texture kept as
+/// BC3 or BC1: through the encoder
 bool texture_copy_into_bc(VkCommandBuffer cmd, Texture* src, uint32_t src_level, uint32_t src_layer, int sx, int sy,
                           Texture* dst, uint32_t dst_level, uint32_t dst_layer, int dx, int dy, uint32_t w, uint32_t h,
                           uint32_t layers);

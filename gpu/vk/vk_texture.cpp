@@ -151,9 +151,11 @@ VkFormat view_format_of(VkFormat image, bool astc_decoded, bool bc, int view_nvn
     VkFormat f = widened(vk_format(view_nvn).format, &from);
     if (is_depth_format(image) || f == VK_FORMAT_UNDEFINED) f = image;
     if (astc_decoded) f = (view_nvn >= 0x87 && view_nvn <= 0x94) ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
-    if (bc) {
+    if (bc) {   // (BC3, or BC1 for an opaque one: the image's own format says which)
         if (use != ViewUse::Sample) return VK_FORMAT_UNDEFINED;
-        f = f == VK_FORMAT_R8G8B8A8_SRGB ? VK_FORMAT_BC3_SRGB_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK;
+        const bool srgb = f == VK_FORMAT_R8G8B8A8_SRGB;
+        f = image == VK_FORMAT_BC1_RGBA_UNORM_BLOCK ? (srgb ? VK_FORMAT_BC1_RGBA_SRGB_BLOCK : VK_FORMAT_BC1_RGBA_UNORM_BLOCK)
+                                                    : (srgb ? VK_FORMAT_BC3_SRGB_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK);
     }
     if (use == ViewUse::Storage) f = force_format != VK_FORMAT_UNDEFINED ? force_format : storage_view_format(f);
     if (use == ViewUse::Attachment && (is_astc(f) || is_bc(f))) return VK_FORMAT_UNDEFINED;
@@ -758,7 +760,7 @@ void bc_encode_into(VkCommandBuffer cmd, uint32_t w, uint32_t h, uint32_t n, Tex
     wr[1].pBufferInfo = &bi;
     vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, bc_layout, 0, 2, wr);
     descriptors_disturbed();
-    const BcPush pc{(w + 3) / 4, (h + 3) / 4, w, h, 1, 0};
+    const BcPush pc{(w + 3) / 4, (h + 3) / 4, w, h, dst.format == VK_FORMAT_BC1_RGBA_UNORM_BLOCK ? 0u : 1u, 0};   // (bc3: 0 for BC1)
     vkCmdPushConstants(cmd, bc_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
     vkCmdDispatch(cmd, (pc.blocks_x + 7) / 8, (pc.blocks_y + 7) / 8, n);
     full_barrier(cmd);
@@ -1995,6 +1997,37 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
             return false;
         }();
         static const bool rgba8_instead = env_on("RX_VK_UNEVEN_RGBA8");
+        // (hookshot) an opaque one as BC1, half of BC3: its ASTC blocks' endpoint modes read once here (astc_bc_policy.h).
+        // An RTX 3060 Ti (7.25 GB allowed) sat at 7.0-7.3 GB in Kokiri Forest and hitched on turns where it went over.
+        // RX_VK_ASTC_BC1=0: every one BC3, as before
+        static const bool bc1_on = [] {
+            const char* e = getenv("RX_VK_ASTC_BC1");
+            const bool on = !e || !env_value_off(e);
+            logf("vk: opaque big ASTC textures as BC1 (half of BC3): %s (RX_VK_ASTC_BC1)", on ? "on" : "off");
+            return on;
+        }();
+        auto bc_format = [&]() {
+            if (!bc1_on) return VK_FORMAT_BC3_UNORM_BLOCK;
+            static int n_bc1, n_bc3;
+            static uint64_t saved, scan_us;
+            const auto t0 = std::chrono::steady_clock::now();
+            std::vector<uint8_t> scratch;
+            const uint8_t* p = x.guest_size ? guest_bytes(x.gpu, x.guest_size, scratch) : nullptr;
+            const bool alpha = !p || astc_bc_policy::astc_may_have_alpha(p, x.guest_size);
+            scan_us += (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+            if (!alpha) {
+                uint64_t blocks = 0;   // (BC3's 16 bytes a block, BC1's 8)
+                for (uint32_t l = 0; l < x.levels; l++)
+                    blocks += (uint64_t)bc_levels::blocks(std::max(1u, x.width >> l)) * bc_levels::blocks(std::max(1u, x.height >> l));
+                saved += blocks * x.layers * 8;
+            }
+            const int n = ++(alpha ? n_bc3 : n_bc1);
+            if (n <= 4 || (n & (n - 1)) == 0)
+                logf("vk: texture %#llx %ux%u x%u, %u levels: %s (%d as BC1, %d kept BC3 so far; %llu MB less than all BC3, "
+                     "%.1f ms reading their blocks)", (unsigned long long)x.gpu, x.width, x.height, x.layers, x.levels,
+                     alpha ? "alpha, BC3" : "opaque, BC1", n_bc1, n_bc3, (unsigned long long)(saved >> 20), scan_us / 1000.0);
+            return alpha ? VK_FORMAT_BC3_UNORM_BLOCK : VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
+        };
         const bool bc_candidate = astc && !(x.skip && x.layers == 1) && x.type == VK_IMAGE_TYPE_2D &&
                                   x.samples == VK_SAMPLE_COUNT_1_BIT && x.width <= kBcDim && x.height <= kBcDim &&
                                   px * x.layers * 4 >= min_bytes;
@@ -2018,7 +2051,7 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
                          n_rgba8, (unsigned long long)mb_saved);
                 x.width = ew, x.height = eh, x.levels = el;
                 x.bc = true, x.bc_resized = resize;
-                x.format = VK_FORMAT_BC3_UNORM_BLOCK;
+                x.format = bc_format();
             } else {
                 n_rgba8++;
                 if (n_rgba8 <= 4 || (n_rgba8 & (n_rgba8 - 1)) == 0)
@@ -2027,7 +2060,7 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
             }
         } else if (bc_candidate && bc_ready()) {
             x.bc = true;
-            x.format = VK_FORMAT_BC3_UNORM_BLOCK;
+            x.format = bc_format();
         }
     }
     const VkFormatProperties fp = format_props(x.format);
@@ -2045,7 +2078,9 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
         // Raw storage views address one compressed block per texel (8 or 16 bytes).
         flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT |
                  VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
-        const VkFormat raw = bpb == 8 ? VK_FORMAT_R32G32_UINT : VK_FORMAT_R32G32B32A32_UINT;
+        // (a decoded ASTC texture kept as BC: its image's blocks, not the ASTC source's 16 bytes; BC1's are 8)
+        const bool eight = x.bc ? x.format == VK_FORMAT_BC1_RGBA_UNORM_BLOCK : bpb == 8;
+        const VkFormat raw = eight ? VK_FORMAT_R32G32_UINT : VK_FORMAT_R32G32B32A32_UINT;
         VkImageFormatProperties limits{};
         // (asked without STORAGE: AMD's driver checks that against the compressed format and says no, though it makes
         // the image and its raw views (RX 6600 XT, amdvlk); without them the game's BC encoders wrote nowhere and
@@ -2602,7 +2637,7 @@ Texture* texture_touch(Texture* tex, bool for_sampling) {
             if (partial) for (const auto& r : dirty) part += r.second - r.first;
             logf("vk: slow upload %.1f ms: #%u %#llx %ux%ux%u x%u levels %u NVN %#x%s%s, %llu of %llu KB%s", ms, tex->id,
                  (unsigned long long)tex->gpu, tex->width, tex->height, tex->depth, tex->layers, tex->levels,
-                 tex->nvn_format, tex->astc ? " ASTC" : "", tex->bc ? " (BC3)" : "",
+                 tex->nvn_format, tex->astc ? " ASTC" : "", !tex->bc ? "" : tex->format == VK_FORMAT_BC1_RGBA_UNORM_BLOCK ? " (BC1)" : " (BC3)",
                  (unsigned long long)((partial ? part : tex->guest_size) >> 10), (unsigned long long)(tex->guest_size >> 10),
                  tex->uploaded ? " again" : "");
         }
@@ -2884,8 +2919,15 @@ void copy_block_attachment(VkCommandBuffer cmd, const Texture& tex, VkImage bloc
 bool texture_copy_into_bc(VkCommandBuffer cmd, Texture* src, uint32_t src_level, uint32_t src_layer, int sx, int sy,
                           Texture* dst, uint32_t dst_level, uint32_t dst_layer, int dx, int dy, uint32_t w, uint32_t h,
                           uint32_t layers) {
-    if (!src || !dst || !dst->bc || !src->astc || src->bc || !bc_ready() || w > kBcDim || h > kBcDim || (dx & 3) || (dy & 3))
+    if (!src || !dst || !dst->bc || !src->astc || !bc_ready() || w > kBcDim || h > kBcDim || (dx & 3) || (dy & 3))
         return false;
+    // (hookshot) from a BC one too, when their BC formats differ (BC1 and BC3: RX_VK_ASTC_BC1): its blocks decompressed by a
+    // blit into the scratch, then encoded as the copy's are. Not from a resized one (hookshot-amd: its texels are not the game's)
+    if (src->bc) {
+        VkFormatProperties fp{};
+        vkGetPhysicalDeviceFormatProperties(dev.physical, src->format, &fp);
+        if (src->bc_resized || !(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT)) return false;
+    }
     // (hookshot-amd) into a resized BC3 image only whole levels, resized as their upload is
     const uint32_t ow = std::max(1u, dst->width >> dst_level), oh = std::max(1u, dst->height >> dst_level);
     if (dst->bc_resized) {
@@ -2903,9 +2945,20 @@ bool texture_copy_into_bc(VkCommandBuffer cmd, Texture* src, uint32_t src_level,
     for (uint32_t l0 = 0; l0 < layers; l0 += kBcLayers) {
         const uint32_t n = std::min(kBcLayers, layers - l0);
         full_barrier(cmd);
-        const VkImageCopy cp{{VK_IMAGE_ASPECT_COLOR_BIT, src_level, src_layer + l0, n}, {sx, sy, 0},
-                             {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, n}, {0, 0, 0}, {w, h, 1}};
-        vkCmdCopyImage(cmd, src->image, VK_IMAGE_LAYOUT_GENERAL, bc_scratch, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+        if (src->bc) {   // (decompressed: a blit at the same size)
+            VkImageBlit bl{};
+            bl.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, src_level, src_layer + l0, n};
+            bl.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, n};
+            bl.srcOffsets[0] = {sx, sy, 0};
+            bl.srcOffsets[1] = {sx + (int32_t)w, sy + (int32_t)h, 1};
+            bl.dstOffsets[1] = {(int32_t)w, (int32_t)h, 1};
+            vkCmdBlitImage(cmd, src->image, VK_IMAGE_LAYOUT_GENERAL, bc_scratch, VK_IMAGE_LAYOUT_GENERAL, 1, &bl,
+                           VK_FILTER_NEAREST);
+        } else {
+            const VkImageCopy cp{{VK_IMAGE_ASPECT_COLOR_BIT, src_level, src_layer + l0, n}, {sx, sy, 0},
+                                 {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, n}, {0, 0, 0}, {w, h, 1}};
+            vkCmdCopyImage(cmd, src->image, VK_IMAGE_LAYOUT_GENERAL, bc_scratch, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+        }
         if (dst->bc_resized)
             bc_encode_resized(cmd, w, h, ow, oh, n, *dst, dst_level, dst_layer + l0);
         else
